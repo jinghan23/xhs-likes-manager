@@ -1,0 +1,110 @@
+# XHS Likes Manager Configuration
+# Copy this file to config.yaml and edit as needed.
+
+# Your XHS user ID (find it in your profile URL or after running 'login')
+user_id: ""
+
+# Where to store data (relative to this file's directory)
+data_dir: "./data"
+
+# Browser profile directory (stores login session cookies)
+browser_profile_dir: "./data/browser_profile"
+
+# XHS base URL (no need to change)
+xhs_base_url: "https://www.xiaohongshu.com"
+
+# Browser settings
+browser:
+  viewport_width: 1280
+  viewport_height: 900
+  locale: "zh-CN"
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+# Fetch settings
+fetch:
+  max_scrolls_likes: 50        # Max scroll attempts for likes
+  max_scrolls_bookmarks: 30    # Max scroll attempts for bookmarks
+  scroll_wait_ms: 2000         # Wait between scrolls (ms)
+  no_change_threshold: 3       # Stop after N scrolls with no new items
+
+# Tag rules: each rule has a name and list of keywords (case-insensitive)
+# Items matching any keyword get that tag. Items matching no rule get "其他".
+tag_rules:
+  - name: "AI/LLM"
+    keywords:
+      - "llm"
+      - "大模型"
+      - "gpt"
+      - "transformer"
+      - "预训练"
+      - "fine-tun"
+      - "微调"
+      - "强化学习"
+      - "reinforcement"
+      - "rlhf"
+      - "reasoning"
+      - "推理"
+      - "论文"
+      - "paper"
+      - "arxiv"
+      - "deepseek"
+      - "claude"
+      - "openai"
+      - "agent"
+      - "multimodal"
+      - "多模态"
+      - "prompt"
+      - "survey"
+
+  - name: "编程"
+    keywords:
+      - "leetcode"
+      - "算法"
+      - "coding"
+      - "编程"
+      - "python"
+      - "github"
+      - "开源"
+
+  - name: "学术/PhD"
+    keywords:
+      - "phd"
+      - "博士"
+      - "科研"
+      - "学术"
+      - "导师"
+
+  - name: "美食"
+    keywords:
+      - "美食"
+      - "餐厅"
+      - "好吃"
+      - "做饭"
+      - "菜谱"
+      - "咖啡"
+
+  - name: "旅行"
+    keywords:
+      - "旅行"
+      - "旅游"
+      - "攻略"
+      - "景点"
+      - "滑雪"
+
+  - name: "生活"
+    keywords:
+      - "租房"
+      - "理财"
+      - "穿搭"
+      - "护肤"
+      - "健身"
+
+# Paper extraction settings
+paper_extraction:
+  arxiv_rate_limit_sec: 1.0    # Seconds between arXiv API requests
+  arxiv_max_results: 3          # Max results per arXiv search
+  content_selectors:            # CSS selectors for post content
+    - "#detail-title"
+    - "#detail-desc"
+    - ".note-text"
+  page_load_wait_ms: 4000      # Wait for page load (ms)
