@@ -7,7 +7,7 @@ import urllib.request
 from playwright.sync_api import sync_playwright
 
 from .config import Config
-from .auth import create_persistent_context
+from .browser import create_persistent_context
 from .utils import load_db, save_db, now_cn
 
 

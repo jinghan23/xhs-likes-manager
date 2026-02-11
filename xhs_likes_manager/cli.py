@@ -22,12 +22,12 @@ def _load_config(args) -> Config:
 
 
 def cmd_login(args):
-    from .auth import login
+    from .browser import login
     login(_load_config(args))
 
 
 def cmd_fetch(args):
-    from .fetcher import fetch_likes, fetch_bookmarks
+    from .browser import fetch_likes, fetch_bookmarks
     config = _load_config(args)
     kind = args.type
     if kind in ("likes", "all"):
@@ -111,7 +111,7 @@ def cmd_extract_papers(args):
 
 
 def cmd_unlike(args):
-    from .unlike import unlike_post
+    from .browser import unlike_post
     unlike_post(_load_config(args), args.id)
 
 
