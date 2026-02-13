@@ -88,10 +88,18 @@ def _fetch_by_tab(
     tab_name: str,
     api_pattern: str,
     max_scrolls: int,
+    known_ids: set[str] | None = None,
+    stop_after_consecutive: int = 10,
 ) -> list[dict]:
-    """Click a tab on the profile page and intercept API responses."""
+    """Click a tab on the profile page and intercept API responses.
+
+    Incremental mode: if *known_ids* is provided, stop scrolling after
+    encountering *stop_after_consecutive* consecutive known IDs (the list
+    is reverse-chronological, so new items are at the top).
+    """
     all_notes: list[dict] = []
     fetch_cfg = config.fetch
+    incremental = known_ids is not None
 
     with sync_playwright() as p:
         context = create_persistent_context(p, config, headless=False)
@@ -103,8 +111,12 @@ def _fetch_by_tab(
             context.close()
             sys.exit(1)
         print(f"👤 User ID: {user_id}")
+        if incremental:
+            print(f"📊 Incremental mode: {len(known_ids)} known IDs, stop after {stop_after_consecutive} consecutive")
 
         collected: list[dict] = []
+        consecutive_known = 0
+        hit_stop = False
 
         def capture_api(response):
             if api_pattern in response.url:
@@ -112,6 +124,21 @@ def _fetch_by_tab(
                     collected.append(response.json())
                 except Exception:
                     pass
+
+        def process_collected():
+            nonlocal consecutive_known, hit_stop
+            for resp in collected:
+                notes = resp.get("data", {}).get("notes", [])
+                for note in notes:
+                    nid = note.get("note_id", "")
+                    if incremental and nid in known_ids:
+                        consecutive_known += 1
+                        if consecutive_known >= stop_after_consecutive:
+                            hit_stop = True
+                            return
+                    else:
+                        consecutive_known = 0
+                        all_notes.append(note)
 
         page.on("response", capture_api)
         page.goto(
@@ -129,34 +156,35 @@ def _fetch_by_tab(
             context.close()
             return []
 
-        for resp in collected:
-            notes = resp.get("data", {}).get("notes", [])
-            all_notes.extend(notes)
-        print(f"   Initial: {len(all_notes)} items")
+        process_collected()
+        collected.clear()
+        print(f"   Initial: {len(all_notes)} new items")
 
-        prev_count = len(all_notes)
-        no_change = 0
-        scroll_wait = fetch_cfg.get("scroll_wait_ms", 2000)
-        threshold = fetch_cfg.get("no_change_threshold", 3)
+        if not hit_stop:
+            prev_count = len(all_notes)
+            no_change = 0
+            scroll_wait = fetch_cfg.get("scroll_wait_ms", 2000)
+            threshold = fetch_cfg.get("no_change_threshold", 3)
 
-        for i in range(max_scrolls):
-            collected.clear()
-            page.evaluate("window.scrollBy(0, 1000)")
-            page.wait_for_timeout(scroll_wait)
+            for i in range(max_scrolls):
+                collected.clear()
+                page.evaluate("window.scrollBy(0, 1000)")
+                page.wait_for_timeout(scroll_wait)
 
-            for resp in collected:
-                notes = resp.get("data", {}).get("notes", [])
-                all_notes.extend(notes)
-
-            curr = len(all_notes)
-            if curr == prev_count:
-                no_change += 1
-                if no_change >= threshold:
+                process_collected()
+                if hit_stop:
+                    print(f"   ⏹ Hit {stop_after_consecutive} consecutive known IDs — stopping")
                     break
-            else:
-                no_change = 0
-                print(f"   Scroll {i + 1}: {curr} total")
-            prev_count = curr
+
+                curr = len(all_notes)
+                if curr == prev_count:
+                    no_change += 1
+                    if no_change >= threshold:
+                        break
+                else:
+                    no_change = 0
+                    print(f"   Scroll {i + 1}: {curr} total new")
+                prev_count = curr
 
         context.close()
 
@@ -214,22 +242,24 @@ def _process_notes(notes: list[dict], config: Config, db_path, md_path, md_title
     return new_count
 
 
-def fetch_likes(config: Config) -> int:
+def fetch_likes(config: Config, full: bool = False) -> int:
     """Fetch liked posts."""
     print("❤️ Fetching likes (点赞)...")
     max_scrolls = config.fetch.get("max_scrolls_likes", 50)
-    notes = _fetch_by_tab(config, "点赞", LIKE_API, max_scrolls)
+    known = None if full else {item["id"] for item in load_db(config.likes_file)["items"]}
+    notes = _fetch_by_tab(config, "点赞", LIKE_API, max_scrolls, known_ids=known)
     new = _process_notes(notes, config, config.likes_file, config.likes_md, "小红书点赞")
     db = load_db(config.likes_file)
     print(f"\n✅ {len(notes)} found, {new} new. Total: {len(db['items'])}")
     return new
 
 
-def fetch_bookmarks(config: Config) -> int:
+def fetch_bookmarks(config: Config, full: bool = False) -> int:
     """Fetch bookmarked posts."""
     print("📚 Fetching bookmarks (收藏)...")
     max_scrolls = config.fetch.get("max_scrolls_bookmarks", 30)
-    notes = _fetch_by_tab(config, "收藏", COLLECT_API, max_scrolls)
+    known = None if full else {item["id"] for item in load_db(config.bookmarks_file)["items"]}
+    notes = _fetch_by_tab(config, "收藏", COLLECT_API, max_scrolls, known_ids=known)
     new = _process_notes(
         notes, config, config.bookmarks_file, config.bookmarks_md, "小红书收藏夹"
     )

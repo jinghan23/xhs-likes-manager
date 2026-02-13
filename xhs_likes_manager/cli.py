@@ -30,10 +30,11 @@ def cmd_fetch(args):
     from .browser import fetch_likes, fetch_bookmarks
     config = _load_config(args)
     kind = args.type
+    full = getattr(args, "full", False)
     if kind in ("likes", "all"):
-        fetch_likes(config)
+        fetch_likes(config, full=full)
     if kind in ("bookmarks", "all"):
-        fetch_bookmarks(config)
+        fetch_bookmarks(config, full=full)
 
 
 def cmd_tag(args):
@@ -142,6 +143,11 @@ def main():
         default="all",
         choices=["likes", "bookmarks", "all"],
         help="What to fetch (default: all)",
+    )
+    p_fetch.add_argument(
+        "--full",
+        action="store_true",
+        help="Full fetch (ignore known IDs, re-fetch everything)",
     )
 
     # tag
