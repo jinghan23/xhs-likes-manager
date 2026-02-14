@@ -1,6 +1,8 @@
 """Browser context management, login, fetching, and unlike operations."""
 
+import json
 import sys
+from pathlib import Path
 from playwright.sync_api import sync_playwright, BrowserContext, Playwright
 
 from .config import Config
@@ -15,13 +17,18 @@ LIKE_API = "note/like/page"
 # Browser context helpers
 # ---------------------------------------------------------------------------
 
+def _storage_state_path(config: Config) -> Path:
+    """Path to the saved storage state (cookies + localStorage)."""
+    return config.browser_profile_dir / "storage_state.json"
+
+
 def create_persistent_context(
     playwright: Playwright, config: Config, headless: bool = False
 ) -> BrowserContext:
     """Create a persistent browser context with anti-detection settings."""
     config.browser_profile_dir.mkdir(parents=True, exist_ok=True)
     browser_cfg = config.browser
-    return playwright.chromium.launch_persistent_context(
+    context = playwright.chromium.launch_persistent_context(
         user_data_dir=str(config.browser_profile_dir),
         headless=headless,
         viewport={
@@ -32,6 +39,27 @@ def create_persistent_context(
         args=[f"--lang={browser_cfg['locale']}"],
         user_agent=browser_cfg["user_agent"],
     )
+    # Restore session cookies that Chromium doesn't persist natively
+    ss_path = _storage_state_path(config)
+    if ss_path.exists():
+        try:
+            state = json.loads(ss_path.read_text())
+            cookies = state.get("cookies", [])
+            if cookies:
+                context.add_cookies(cookies)
+        except Exception:
+            pass
+    return context
+
+
+def save_and_close(context: BrowserContext, config: Config) -> None:
+    """Save storage state (cookies) then close the context."""
+    try:
+        ss_path = _storage_state_path(config)
+        context.storage_state(path=str(ss_path))
+    except Exception:
+        pass
+    context.close()
 
 
 def get_my_user_id(page) -> str | None:
@@ -76,7 +104,7 @@ def login(config: Config) -> None:
             print(f'   Add this to your config.yaml: user_id: "{uid}"')
         else:
             print("⚠️  Could not verify login, but browser profile saved.")
-        context.close()
+        save_and_close(context, config)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +136,7 @@ def _fetch_by_tab(
         user_id = config.user_id or get_my_user_id(page)
         if not user_id:
             print("❌ Not logged in. Run 'login' first.")
-            context.close()
+            save_and_close(context, config)
             sys.exit(1)
         print(f"👤 User ID: {user_id}")
         if incremental:
@@ -153,7 +181,7 @@ def _fetch_by_tab(
             page.wait_for_timeout(3000)
         else:
             print(f'⚠️  Could not find "{tab_name}" tab')
-            context.close()
+            save_and_close(context, config)
             return []
 
         process_collected()
@@ -186,7 +214,7 @@ def _fetch_by_tab(
                     print(f"   Scroll {i + 1}: {curr} total new")
                 prev_count = curr
 
-        context.close()
+        save_and_close(context, config)
 
     # Deduplicate
     seen: set[str] = set()
@@ -346,7 +374,7 @@ def unlike_post(config: Config, item_id: str) -> None:
             print("⚠️ Could not find like button automatically.")
             print("   You may need to unlike manually.")
 
-        context.close()
+        save_and_close(context, config)
 
     item["removed"] = True
     item["removed_at"] = now_cn()
