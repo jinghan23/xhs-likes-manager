@@ -1,9 +1,14 @@
-"""Browser context management, login, fetching, and unlike operations."""
+"""Browser context management, login, fetching, and unlike operations.
+
+Uses OpenClaw's browser (CDP on localhost:18800) as the single shared browser.
+Fallback: launch own Playwright Chromium if CDP is unavailable.
+"""
 
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from playwright.sync_api import sync_playwright, BrowserContext, Playwright
+from playwright.sync_api import sync_playwright, BrowserContext, Playwright, Page
 
 from .config import Config
 from .utils import load_db, save_db, export_markdown, now_cn
@@ -12,20 +17,39 @@ from .utils import load_db, save_db, export_markdown, now_cn
 COLLECT_API = "note/collect/page"
 LIKE_API = "note/like/page"
 
+# OpenClaw browser CDP endpoint
+OPENCLAW_CDP_URL = "http://127.0.0.1:18800"
+
 
 # ---------------------------------------------------------------------------
 # Browser context helpers
 # ---------------------------------------------------------------------------
 
-def _storage_state_path(config: Config) -> Path:
-    """Path to the saved storage state (cookies + localStorage)."""
-    return config.browser_profile_dir / "storage_state.json"
+@contextmanager
+def _get_context(playwright: Playwright, config: Config, headless: bool = False):
+    """Get a browser context — prefer OpenClaw CDP, fallback to own Chromium.
 
+    Yields (context, is_shared) where is_shared=True means we connected to
+    an existing browser and should NOT close the context when done.
+    """
+    # Try connecting to OpenClaw's browser via CDP
+    try:
+        browser = playwright.chromium.connect_over_cdp(OPENCLAW_CDP_URL, timeout=5000)
+        contexts = browser.contexts
+        if contexts:
+            context = contexts[0]
+        else:
+            context = browser.new_context()
+        print("🔗 Connected to OpenClaw browser (shared cookies)")
+        yield context, True
+        # Don't close — it's openclaw's browser
+        browser.close()  # just disconnects, doesn't kill the browser
+        return
+    except Exception:
+        pass
 
-def create_persistent_context(
-    playwright: Playwright, config: Config, headless: bool = False
-) -> BrowserContext:
-    """Create a persistent browser context with anti-detection settings."""
+    # Fallback: launch own persistent context
+    print("⚠️  OpenClaw browser not available, using standalone Chromium")
     config.browser_profile_dir.mkdir(parents=True, exist_ok=True)
     browser_cfg = config.browser
     context = playwright.chromium.launch_persistent_context(
@@ -39,8 +63,8 @@ def create_persistent_context(
         args=[f"--lang={browser_cfg['locale']}"],
         user_agent=browser_cfg["user_agent"],
     )
-    # Restore session cookies that Chromium doesn't persist natively
-    ss_path = _storage_state_path(config)
+    # Restore session cookies for fallback mode
+    ss_path = config.browser_profile_dir / "storage_state.json"
     if ss_path.exists():
         try:
             state = json.loads(ss_path.read_text())
@@ -49,20 +73,19 @@ def create_persistent_context(
                 context.add_cookies(cookies)
         except Exception:
             pass
-    return context
-
-
-def save_and_close(context: BrowserContext, config: Config) -> None:
-    """Save storage state (cookies) then close the context."""
     try:
-        ss_path = _storage_state_path(config)
-        context.storage_state(path=str(ss_path))
-    except Exception:
-        pass
-    context.close()
+        yield context, False
+    finally:
+        # Save cookies before closing in fallback mode
+        try:
+            ss_path = config.browser_profile_dir / "storage_state.json"
+            context.storage_state(path=str(ss_path))
+        except Exception:
+            pass
+        context.close()
 
 
-def get_my_user_id(page) -> str | None:
+def get_my_user_id(page: Page) -> str | None:
     """Detect logged-in user ID from XHS API response."""
     user_id = None
 
@@ -90,21 +113,26 @@ def get_my_user_id(page) -> str | None:
 # ---------------------------------------------------------------------------
 
 def login(config: Config) -> None:
-    """Open browser for manual XHS login."""
+    """Open browser for manual XHS login.
+
+    If OpenClaw browser is running, opens a tab there.
+    Otherwise launches standalone Chromium.
+    """
     print("🔐 Opening browser for XHS login...")
     print("   Log in manually, then press Enter here.\n")
     with sync_playwright() as p:
-        context = create_persistent_context(p, config, headless=False)
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(config.xhs_base_url)
-        input("⏳ Press Enter after login... ")
-        uid = get_my_user_id(page)
-        if uid:
-            print(f"✅ Logged in! User ID: {uid}")
-            print(f'   Add this to your config.yaml: user_id: "{uid}"')
-        else:
-            print("⚠️  Could not verify login, but browser profile saved.")
-        save_and_close(context, config)
+        with _get_context(p, config, headless=False) as (context, is_shared):
+            page = context.new_page()
+            page.goto(config.xhs_base_url)
+            input("⏳ Press Enter after login... ")
+            uid = get_my_user_id(page)
+            if uid:
+                print(f"✅ Logged in! User ID: {uid}")
+                print(f'   Add this to your config.yaml: user_id: "{uid}"')
+            else:
+                print("⚠️  Could not verify login, but cookies saved.")
+            if is_shared:
+                page.close()
 
 
 # ---------------------------------------------------------------------------
@@ -119,102 +147,98 @@ def _fetch_by_tab(
     known_ids: set[str] | None = None,
     stop_after_consecutive: int = 10,
 ) -> list[dict]:
-    """Click a tab on the profile page and intercept API responses.
-
-    Incremental mode: if *known_ids* is provided, stop scrolling after
-    encountering *stop_after_consecutive* consecutive known IDs (the list
-    is reverse-chronological, so new items are at the top).
-    """
+    """Click a tab on the profile page and intercept API responses."""
     all_notes: list[dict] = []
     fetch_cfg = config.fetch
     incremental = known_ids is not None
 
     with sync_playwright() as p:
-        context = create_persistent_context(p, config, headless=False)
-        page = context.pages[0] if context.pages else context.new_page()
+        with _get_context(p, config, headless=False) as (context, is_shared):
+            page = context.new_page()
 
-        user_id = config.user_id or get_my_user_id(page)
-        if not user_id:
-            print("❌ Not logged in. Run 'login' first.")
-            save_and_close(context, config)
-            sys.exit(1)
-        print(f"👤 User ID: {user_id}")
-        if incremental:
-            print(f"📊 Incremental mode: {len(known_ids)} known IDs, stop after {stop_after_consecutive} consecutive")
+            user_id = config.user_id or get_my_user_id(page)
+            if not user_id:
+                print("❌ Not logged in. Run 'login' first.")
+                page.close()
+                sys.exit(1)
+            print(f"👤 User ID: {user_id}")
+            if incremental:
+                print(f"📊 Incremental mode: {len(known_ids)} known IDs, "
+                      f"stop after {stop_after_consecutive} consecutive")
 
-        collected: list[dict] = []
-        consecutive_known = 0
-        hit_stop = False
+            collected: list[dict] = []
+            consecutive_known = 0
+            hit_stop = False
 
-        def capture_api(response):
-            if api_pattern in response.url:
-                try:
-                    collected.append(response.json())
-                except Exception:
-                    pass
+            def capture_api(response):
+                if api_pattern in response.url:
+                    try:
+                        collected.append(response.json())
+                    except Exception:
+                        pass
 
-        def process_collected():
-            nonlocal consecutive_known, hit_stop
-            for resp in collected:
-                notes = resp.get("data", {}).get("notes", [])
-                for note in notes:
-                    nid = note.get("note_id", "")
-                    if incremental and nid in known_ids:
-                        consecutive_known += 1
-                        if consecutive_known >= stop_after_consecutive:
-                            hit_stop = True
-                            return
-                    else:
-                        consecutive_known = 0
-                        all_notes.append(note)
+            def process_collected():
+                nonlocal consecutive_known, hit_stop
+                for resp in collected:
+                    notes = resp.get("data", {}).get("notes", [])
+                    for note in notes:
+                        nid = note.get("note_id", "")
+                        if incremental and nid in known_ids:
+                            consecutive_known += 1
+                            if consecutive_known >= stop_after_consecutive:
+                                hit_stop = True
+                                return
+                        else:
+                            consecutive_known = 0
+                            all_notes.append(note)
 
-        page.on("response", capture_api)
-        page.goto(
-            f"{config.xhs_base_url}/user/profile/{user_id}",
-            wait_until="networkidle",
-        )
-        page.wait_for_timeout(2000)
+            page.on("response", capture_api)
+            page.goto(
+                f"{config.xhs_base_url}/user/profile/{user_id}",
+                wait_until="networkidle",
+            )
+            page.wait_for_timeout(2000)
 
-        tab = page.query_selector(f'.reds-tab-item:has-text("{tab_name}")')
-        if tab:
-            tab.click()
-            page.wait_for_timeout(3000)
-        else:
-            print(f'⚠️  Could not find "{tab_name}" tab')
-            save_and_close(context, config)
-            return []
+            tab = page.query_selector(f'.reds-tab-item:has-text("{tab_name}")')
+            if tab:
+                tab.click()
+                page.wait_for_timeout(3000)
+            else:
+                print(f'⚠️  Could not find "{tab_name}" tab')
+                page.close()
+                return []
 
-        process_collected()
-        collected.clear()
-        print(f"   Initial: {len(all_notes)} new items")
+            process_collected()
+            collected.clear()
+            print(f"   Initial: {len(all_notes)} new items")
 
-        if not hit_stop:
-            prev_count = len(all_notes)
-            no_change = 0
-            scroll_wait = fetch_cfg.get("scroll_wait_ms", 2000)
-            threshold = fetch_cfg.get("no_change_threshold", 3)
+            if not hit_stop:
+                prev_count = len(all_notes)
+                no_change = 0
+                scroll_wait = fetch_cfg.get("scroll_wait_ms", 2000)
+                threshold = fetch_cfg.get("no_change_threshold", 3)
 
-            for i in range(max_scrolls):
-                collected.clear()
-                page.evaluate("window.scrollBy(0, 1000)")
-                page.wait_for_timeout(scroll_wait)
+                for i in range(max_scrolls):
+                    collected.clear()
+                    page.evaluate("window.scrollBy(0, 1000)")
+                    page.wait_for_timeout(scroll_wait)
 
-                process_collected()
-                if hit_stop:
-                    print(f"   ⏹ Hit {stop_after_consecutive} consecutive known IDs — stopping")
-                    break
-
-                curr = len(all_notes)
-                if curr == prev_count:
-                    no_change += 1
-                    if no_change >= threshold:
+                    process_collected()
+                    if hit_stop:
+                        print(f"   ⏹ Hit {stop_after_consecutive} consecutive known IDs — stopping")
                         break
-                else:
-                    no_change = 0
-                    print(f"   Scroll {i + 1}: {curr} total new")
-                prev_count = curr
 
-        save_and_close(context, config)
+                    curr = len(all_notes)
+                    if curr == prev_count:
+                        no_change += 1
+                        if no_change >= threshold:
+                            break
+                    else:
+                        no_change = 0
+                        print(f"   Scroll {i + 1}: {curr} total new")
+                    prev_count = curr
+
+            page.close()
 
     # Deduplicate
     seen: set[str] = set()
@@ -318,63 +342,63 @@ def unlike_post(config: Config, item_id: str) -> None:
     print(f"🔗 Opening: {url}")
 
     with sync_playwright() as p:
-        context = create_persistent_context(p, config, headless=False)
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(url, wait_until="networkidle")
-        page.wait_for_timeout(3000)
+        with _get_context(p, config, headless=False) as (context, is_shared):
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle")
+            page.wait_for_timeout(3000)
 
-        # Try to find the active like button
-        like_btn = page.query_selector(
-            '[class*="like"][class*="active"], '
-            ".like-wrapper.active, "
-            ".like-active, "
-            'button[class*="like"].active'
-        )
-
-        if not like_btn:
+            # Try to find the active like button
             like_btn = page.query_selector(
-                ".engage-bar .like-wrapper, "
-                ".note-detail .like-wrapper, "
-                '[data-type="like"]'
+                '[class*="like"][class*="active"], '
+                ".like-wrapper.active, "
+                ".like-active, "
+                'button[class*="like"].active'
             )
 
-        if not like_btn:
-            result = page.evaluate(
-                """() => {
-                const candidates = document.querySelectorAll('[class*="like"], [class*="Like"]');
-                const info = [];
-                for (const el of candidates) {
-                    info.push({
-                        tag: el.tagName,
-                        class: el.className,
-                        hasActive: el.className.includes('active') || el.className.includes('Active'),
-                    });
-                }
-                return info;
-            }"""
-            )
+            if not like_btn:
+                like_btn = page.query_selector(
+                    ".engage-bar .like-wrapper, "
+                    ".note-detail .like-wrapper, "
+                    '[data-type="like"]'
+                )
 
-            for el_info in result:
-                if el_info.get("hasActive"):
-                    selector = "." + ".".join(el_info["class"].split())
-                    try:
-                        el = page.query_selector(selector)
-                        if el:
-                            like_btn = el
-                            break
-                    except Exception:
-                        continue
+            if not like_btn:
+                result = page.evaluate(
+                    """() => {
+                    const candidates = document.querySelectorAll('[class*="like"], [class*="Like"]');
+                    const info = [];
+                    for (const el of candidates) {
+                        info.push({
+                            tag: el.tagName,
+                            class: el.className,
+                            hasActive: el.className.includes('active') || el.className.includes('Active'),
+                        });
+                    }
+                    return info;
+                }"""
+                )
 
-        if like_btn:
-            print("❤️ Found like button, clicking to unlike...")
-            like_btn.click()
-            page.wait_for_timeout(2000)
-            print("✅ Clicked! Post should be unliked.")
-        else:
-            print("⚠️ Could not find like button automatically.")
-            print("   You may need to unlike manually.")
+                for el_info in result:
+                    if el_info.get("hasActive"):
+                        selector = "." + ".".join(el_info["class"].split())
+                        try:
+                            el = page.query_selector(selector)
+                            if el:
+                                like_btn = el
+                                break
+                        except Exception:
+                            continue
 
-        save_and_close(context, config)
+            if like_btn:
+                print("❤️ Found like button, clicking to unlike...")
+                like_btn.click()
+                page.wait_for_timeout(2000)
+                print("✅ Clicked! Post should be unliked.")
+            else:
+                print("⚠️ Could not find like button automatically.")
+                print("   You may need to unlike manually.")
+
+            page.close()
 
     item["removed"] = True
     item["removed_at"] = now_cn()
